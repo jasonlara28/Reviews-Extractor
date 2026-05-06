@@ -30,17 +30,28 @@ def fetch_reviews_pages(product_id, max_pages=5):
 
     for page in range(1, max_pages + 1):
         url = f"https://www.walmart.com/reviews/product/{product_id}?page={page}"
-        
+
         try:
             response = requests.get(url, headers=headers)
+
+            # --- DEBUG START ---
+            st.write("URL:", url)
+            st.write("HTTP status:", response.status_code)
+            st.write("Response length:", len(response.text))
+            st.write("Contains '__NEXT_DATA__':", "__NEXT_DATA__" in response.text)
+            st.write("Contains 'reviewText':", "reviewText" in response.text)
+            st.write("First 300 chars:", response.text[:300])
+            st.write("----------------------")
+            # --- DEBUG END ---
 
             if response.status_code != 200:
                 break
 
             all_html.append(response.text)
-            time.sleep(0.6)  # prevent getting blocked
+            time.sleep(0.6)
 
-        except Exception:
+        except Exception as e:
+            st.write("Error:", str(e))
             break
 
     return "\n".join(all_html)
