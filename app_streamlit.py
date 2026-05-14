@@ -1,6 +1,5 @@
 import streamlit as st
 import pandas as pd
-
 from reviews_core import (
     extract_reviews,
     compute_sentiment,
@@ -13,7 +12,23 @@ st.set_page_config(page_title='Walmart Reviews Explorer', layout='wide')
 st.title('Walmart Reviews Explorer')
 st.caption('Paste Walmart.com review HTML/JSON. Add multiple pages (View Page Source) before parsing.')
 
-# Multi-page append (Undo removed)
+# ---- Custom CSS ----
+st.markdown("""
+<style>
+    .card-row { display:flex; gap:12px; overflow-x:auto; padding:6px 2px 10px 2px; }
+    .card { min-width: 320px; max-width: 320px; border:1px solid rgba(0,0,0,0.12); border-radius:14px; padding:12px; background:white; }
+    .badge { display:inline-block; padding:2px 10px; border-radius:999px; font-size:12px; font-weight:600; }
+    .badge.pos { background:#e8f7ee; color:#137a3a; }
+    .badge.neu { background:#f1f3f5; color:#495057; }
+    .badge.neg { background:#fdecec; color:#b02a37; }
+    .small { color:#6c757d; font-size:12px; }
+    .rtitle { font-weight:700; margin-top:6px; margin-bottom:6px; }
+    .txt { font-size:13px; line-height:1.35; }
+</style>
+""", unsafe_allow_html=True)
+
+# ---- Multi-page append (Undo removed) ----
+
 if 'pages' not in st.session_state:
     st.session_state['pages'] = []
 
@@ -21,138 +36,164 @@ with st.sidebar:
     st.header('Input')
     mode = st.radio('How do you want to provide data?', ['Paste pages (append)', 'Upload file'], index=0)
 
-    raw_text = ''
-
     if mode == 'Paste pages (append)':
-        new_text = st.text_area('Paste ONE page source (HTML/JSON) here', height=200)
+        raw_input = st.text_area('Paste page source HTML/JSON here', height=200, key='paste_area')
         col_add, col_clear = st.columns(2)
         with col_add:
-            add_clicked = st.button('Add page')
+            if st.button('Add Page', use_container_width=True):
+                if raw_input and raw_input.strip():
+                    st.session_state['pages'].append(raw_input.strip())
+                    st.success('Page ' + str(len(st.session_state['pages'])) + ' added!')
+                else:
+                    st.warning('Paste some content first.')
         with col_clear:
-            clear_clicked = st.button('Clear all')
+            if st.button('Clear All', use_container_width=True):
+                st.session_state['pages'] = []
+                st.info('All pages cleared.')
 
-        if add_clicked and (new_text or '').strip():
-            st.session_state['pages'].append(new_text)
+        st.caption(str(len(st.session_state['pages'])) + ' page(s) loaded')
 
-        if clear_clicked:
-            st.session_state['pages'] = []
-
-        st.caption(f"Pages added: **{len(st.session_state['pages'])}**")
         if st.session_state['pages']:
-            preview = st.session_state['pages'][-1]
-            st.text_area('Last page preview (read-only)', preview[:2000], height=120, disabled=True)
+            with st.expander('Preview loaded pages'):
+                for i, p in enumerate(st.session_state['pages']):
+                    st.text('--- Page ' + str(i + 1) + ' (' + str(len(p)) + ' chars) ---')
+                    preview = p[:300] + ('...' if len(p) > 300 else '')
+                    st.text(preview)
 
-        raw_text = "\n\n".join(st.session_state['pages'])
+        raw_text = chr(10).join(st.session_state['pages'])
 
     else:
-        up = st.file_uploader('Upload a .txt/.html/.json file', type=['txt','html','json'])
-        if up is not None:
-            raw_text = up.getvalue().decode('utf-8', errors='replace')
-
-    st.divider()
-    parse_clicked = st.button('Parse & Analyze', type='primary')
-
-if parse_clicked:
-    with st.spinner('Parsing reviews…'):
-        rows = extract_reviews(raw_text or '')
-
-    if not rows:
-        st.error('No reviews found. Tip: Use View Page Source on each review page and add multiple pages before parsing.')
-        st.stop()
-
-    enriched = compute_sentiment(rows)
-    df = pd.DataFrame(enriched)
-    df['rating_num'] = pd.to_numeric(df['rating'], errors='coerce')
-
-    total_reviews = len(df)
-    avg_rating = df['rating_num'].mean() if total_reviews else None
-    net_sentiment = df['combined_score'].mean() if total_reviews else None
-    low_star = int(((df['rating_num'] <= 2) & (df['rating_num'].notna())).sum())
-    low_star_pct = (low_star / total_reviews) if total_reviews else 0.0
-
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric('Total Reviews', f"{total_reviews:,}")
-    k2.metric('Average Rating', f"{avg_rating:.2f}" if avg_rating == avg_rating else '—')
-    k3.metric('Net Sentiment', f"{net_sentiment:.3f}" if net_sentiment == net_sentiment else '—')
-    k4.metric('1–2 Star %', f"{low_star_pct:.0%}")
-
-    st.divider()
-
-    left, right = st.columns([1, 1])
-    texts = df['reviewText'].fillna('').tolist()
-    top_words, top_phrases = extract_keywords_and_bigrams(texts, top_n_words=25, top_n_bigrams=25)
-
-    with left:
-        st.subheader('Word cloud (compact, top 25 words)')
-        wc_bytes = render_wordcloud_bytes(top_words[:25], fig_size=(4.6, 3.2))
-        if wc_bytes:
-            st.image(wc_bytes, width=360)
+        uploaded = st.file_uploader('Upload HTML/JSON file', type=['html', 'json', 'txt'])
+        if uploaded:
+            raw_text = uploaded.read().decode('utf-8', errors='replace')
         else:
-            st.info('Word cloud unavailable (matplotlib not available).')
-
-    with right:
-        st.subheader('Top keywords & phrases')
-        c1, c2 = st.columns(2)
-        c1.write(pd.DataFrame(top_words, columns=['keyword','count']))
-        c2.write(pd.DataFrame(top_phrases, columns=['phrase','count']))
+            raw_text = ''
 
     st.divider()
-    st.subheader('Review cards')
+    parse_clicked = st.button('Parse & Analyze', type='primary', use_container_width=True)
 
-    st.markdown("""<style>
-.card-row { display:flex; gap:12px; overflow-x:auto; padding:6px 2px 10px 2px; }
-.card { min-width: 320px; max-width: 320px; border:1px solid rgba(0,0,0,0.12); border-radius:14px; padding:12px; background:white; }
-.badge { display:inline-block; padding:2px 10px; border-radius:999px; font-size:12px; font-weight:600; }
-.badge.pos { background:#e8f7ee; color:#137a3a; }
-.badge.neu { background:#f1f3f5; color:#495057; }
-.badge.neg { background:#fdecec; color:#b02a37; }
-.small { color:#6c757d; font-size:12px; }
-.title { font-weight:700; margin-top:6px; margin-bottom:6px; }
-.txt { font-size:13px; line-height:1.35; }
-</style>""", unsafe_allow_html=True)
 
-    df_cards = df.copy()
-    df_cards['date_sort'] = pd.to_datetime(df_cards['reviewSubmissionTime'], errors='coerce')
-    df_cards = df_cards.sort_values('date_sort', ascending=False, na_position='last')
+# ---- Main area ----
+if parse_clicked:
+    if not raw_text or not raw_text.strip():
+        st.warning('No content to parse. Add at least one page or upload a file.')
+    else:
+        with st.spinner('Parsing reviews...'):
+            rows = extract_reviews(raw_text or '')
 
-    cards_html = ['<div class="card-row">']
-    for _, r in df_cards.head(40).iterrows():
-        rating = r.get('rating','')
-        sent = r.get('sentiment','neutral')
-        badge_class = 'neu'
-        if sent == 'positive': badge_class = 'pos'
-        if sent == 'negative': badge_class = 'neg'
-        title = (r.get('reviewTitle','') or '').strip() or '(No title)'
-        date = (r.get('reviewSubmissionTime','') or '').strip()
-        text = (r.get('reviewText','') or '').strip()
-        short = text if len(text) <= 220 else (text[:220] + '…')
-        cs = r.get('combined_score','')
+        if not rows:
+            st.error('No reviews found. Make sure you are pasting the full page source (View Page Source).')
+        else:
+            with st.spinner('Computing sentiment...'):
+                enriched = compute_sentiment(rows)
 
-        cards_html.append(
-            f'<div class="card">'
-            f'<div><span class="badge {badge_class}">{sent.upper()}</span> '
-            f'<span class="small">⭐ {rating} • score {cs}</span></div>'
-            f'<div class="title">{title}</div>'
-            f'<div class="small">{date}</div>'
-            f'<div class="txt">{short}</div>'
-            f'</div>'
-        )
+            df = pd.DataFrame(enriched)
 
-    cards_html.append('</div>')
-    st.markdown(''.join(cards_html), unsafe_allow_html=True)
+            # ---- KPI Metrics ----
+            total = len(enriched)
+            avg_rating = df['rating'].dropna().mean()
+            low_star = df[df['rating'].apply(lambda x: x is not None and float(x) <= 2.0)]
+            low_pct = (len(low_star) / total * 100) if total > 0 else 0
 
-    st.divider()
-    st.subheader('Raw review table')
+            kpi1, kpi2, kpi3 = st.columns(3)
+            with kpi1:
+                st.metric('Total Reviews', total)
+            with kpi2:
+                rating_display = str(round(avg_rating, 1)) + ' stars' if pd.notna(avg_rating) else 'N/A'
+                st.metric('Avg Rating', rating_display)
+            with kpi3:
+                st.metric('% Low Star (1-2)', str(round(low_pct, 1)) + '%')
 
-    show_cols = ['rating','sentiment','combined_score','text_score','rating_score','reviewTitle','reviewSubmissionTime','reviewText']
-    st.dataframe(df[show_cols], use_container_width=True, height=520)
+            st.divider()
 
-    st.download_button(
-        'Download reviews (CSV)',
-        df[show_cols].to_csv(index=False).encode('utf-8'),
-        file_name='reviews_with_sentiment.csv',
-        mime='text/csv'
-    )
+            # ---- Keywords & Word Cloud ----
+            all_texts = [r.get('reviewText', '') for r in enriched if r.get('reviewText')]
+            top_words, top_phrases = extract_keywords_and_bigrams(all_texts)
+
+            # Word Cloud
+            if top_words:
+                st.subheader('Word Cloud')
+                wc_bytes = render_wordcloud_bytes(top_words)
+                if wc_bytes:
+                    st.image(wc_bytes, use_container_width=True)
+                else:
+                    st.caption('Word cloud could not be generated (matplotlib or wordcloud not available).')
+
+            # Top Keywords and Top Phrases side by side
+            col_kw, col_ph = st.columns(2)
+            with col_kw:
+                st.subheader('Top Keywords')
+                if top_words:
+                    kw_df = pd.DataFrame(top_words, columns=['Keyword', 'Count'])
+                    st.dataframe(kw_df, use_container_width=True, hide_index=True)
+                else:
+                    st.caption('No keywords extracted.')
+            with col_ph:
+                st.subheader('Top Phrases')
+                if top_phrases:
+                    ph_df = pd.DataFrame(top_phrases, columns=['Phrase', 'Count'])
+                    st.dataframe(ph_df, use_container_width=True, hide_index=True)
+                else:
+                    st.caption('No phrases extracted.')
+
+            st.divider()
+
+            # ---- Review Cards ----
+            st.subheader('Individual Reviews')
+
+            if enriched:
+                cards_html = '<div class="card-row">'
+                for r in enriched:
+                    label = r.get('sentiment_label', 'neutral')
+                    if label == 'positive':
+                        badge_class = 'pos'
+                    elif label == 'negative':
+                        badge_class = 'neg'
+                    else:
+                        badge_class = 'neu'
+                    badge_text = label.capitalize()
+                    rating = r.get('rating', '')
+                    if rating is not None:
+                        try:
+                            rating_display = str(int(float(rating))) + ' stars'
+                        except Exception:
+                            rating_display = 'N/A'
+                    else:
+                        rating_display = 'N/A'
+                    title = r.get('reviewTitle', '') or ''
+                    text = r.get('reviewText', '') or ''
+                    date = r.get('reviewSubmissionTime', '') or ''
+                    shipping_flag = ' [shipping]' if r.get('shipping_issue') else ''
+
+                    if len(text) > 250:
+                        display_text = text[:250].rsplit(' ', 1)[0] + '...'
+                    else:
+                        display_text = text
+
+                    cards_html += (
+                        '<div class="card">'
+                        + '<span class="badge ' + badge_class + '">' + badge_text + '</span>'
+                        + '<span class="small" style="float:right;">' + rating_display + shipping_flag + '</span>'
+                        + '<div class="rtitle">' + title + '</div>'
+                        + '<div class="txt">' + display_text + '</div>'
+                        + '<div class="small" style="margin-top:6px;">' + date + '</div>'
+                        + '</div>'
+                    )
+                cards_html += '</div>'
+                st.markdown(cards_html, unsafe_allow_html=True)
+
+            st.divider()
+
+            # ---- CSV Export ----
+            st.subheader('Export')
+            export_df = pd.DataFrame(enriched)
+            csv_data = export_df.to_csv(index=False)
+            st.download_button(
+                label='Download CSV',
+                data=csv_data,
+                file_name='walmart_reviews_export.csv',
+                mime='text/csv',
+            )
 
 else:
     st.info('Add one or more pages on the left, then click **Parse & Analyze**.')
