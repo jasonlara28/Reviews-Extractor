@@ -1,9 +1,9 @@
 # reviews_core.py
 # v5:
-#  - ignore non-review labels (Incentivized Review, Verified Purchase)
-#  - parse ALL __NEXT_DATA__ blocks (multi-page append)
-#  - replace noisy bigrams with meaningful 3–4 word phrases
-#  - sentiment: 5★ => 1.0, 1★ => -1.0, plus shipping-vs-product conflict -> neutral
+# - ignore non-review labels (Incentivized Review, Verified Purchase)
+# - parse ALL __NEXT_DATA__ blocks (multi-page append)
+# - replace noisy bigrams with meaningful 3-4 word phrases
+# - sentiment: 5 star => 1.0, 1 star => -1.0, plus shipping-vs-product conflict -> neutral
 
 import json
 import re
@@ -13,16 +13,19 @@ from collections import Counter
 import random
 
 # --------------------- Optional Matplotlib (wordcloud) ---------------------
+
 MATPLOTLIB_OK = True
 MATPLOTLIB_ERR = ''
 try:
     import matplotlib
+    matplotlib.use('Agg')
     import matplotlib.pyplot as plt
 except Exception as e:
     MATPLOTLIB_OK = False
     MATPLOTLIB_ERR = str(e)
 
 # --------------------- Candidate keys ---------------------
+
 KEY_CANDIDATES = {
     'rating': ['rating', 'reviewRating', 'ratingValue', 'overallRating', 'overall_rating', 'overall'],
     'reviewText': ['reviewText', 'reviewTextRaw', 'text', 'reviewContent', 'body', 'review_body', 'commentText'],
@@ -32,6 +35,7 @@ KEY_CANDIDATES = {
 }
 
 # Strings that appear on Walmart pages but are NOT review bodies.
+
 IGNORE_REVIEW_TEXT = {
     'verified purchase',
     'seller verified purchase',
@@ -55,6 +59,7 @@ def normalize_date(s: str) -> str:
             pass
     return s
 
+
 def _coalesce(obj: dict, keys):
     for k in keys:
         if k in obj and obj[k] not in (None, ''):
@@ -63,6 +68,7 @@ def _coalesce(obj: dict, keys):
                 return v['ratingValue']
             return v
     return None
+
 
 def _to_float(x):
     try:
@@ -86,28 +92,34 @@ def _is_noise_reviewtext(txt: str) -> bool:
         return True
     return False
 
+
 def _maybe_add_review(d: dict, out: list):
     review_text = _coalesce(d, KEY_CANDIDATES['reviewText'])
     if review_text is None:
         return
-
-    if isinstance(review_text, str):
-        review_text = htmllib.unescape(review_text)
-        if _is_noise_reviewtext(review_text):
-            return
-        if not review_text.strip():
-            return
+    if not isinstance(review_text, str) or not review_text.strip():
+        return
+    if _is_noise_reviewtext(review_text):
+        return
 
     rating = _coalesce(d, KEY_CANDIDATES['rating'])
+    rating_val = _to_float(rating)
+
     sub_time = _coalesce(d, KEY_CANDIDATES['reviewSubmissionTime'])
     title = _coalesce(d, KEY_CANDIDATES['reviewTitle'])
 
-    out.append({
-        'rating': rating if rating is not None else '',
-        'reviewText': htmllib.unescape(str(review_text)) if review_text is not None else '',
-        'reviewSubmissionTime': normalize_date(str(sub_time)) if sub_time is not None else '',
-        'reviewTitle': htmllib.unescape(str(title)) if title is not None else '',
-    })
+    row = {
+        'reviewText': review_text.strip(),
+        'rating': rating_val,
+        'reviewSubmissionTime': normalize_date(str(sub_time)) if sub_time else '',
+        'reviewTitle': (title.strip() if isinstance(title, str) else '') if title else '',
+    }
+    # Deduplicate by text
+    for existing in out:
+        if existing['reviewText'] == row['reviewText']:
+            return
+    out.append(row)
+
 
 def _walk_json(o, out: list):
     if isinstance(o, dict):
@@ -118,10 +130,14 @@ def _walk_json(o, out: list):
         for item in o:
             _walk_json(item, out)
 
+
 def _extract_all_next_data(text: str):
     out = []
-    for m in re.finditer(r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.*?)</script>',
-                         text, flags=re.DOTALL | re.IGNORECASE):
+    for m in re.finditer(
+        r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.*?)</script>',
+        text,
+        flags=re.DOTALL | re.IGNORECASE
+    ):
         blob = htmllib.unescape(m.group(1))
         try:
             out.append(json.loads(blob))
@@ -129,69 +145,64 @@ def _extract_all_next_data(text: str):
             continue
     return out
 
+
 def _find_json_objects(raw: str):
     results = []
-    key_regex = re.compile(r'(\"reviewText\"|\"reviewTitle\"|\"reviewSubmissionTime\"|\"datePublished\"|\"ratingValue\")')
+    key_regex = re.compile(
+        r'("reviewText"|"reviewTitle"|"reviewSubmissionTime"|"datePublished"|"ratingValue")'
+    )
+    if not key_regex.search(raw):
+        return results
 
-    for m in key_regex.finditer(raw):
-        start = raw.rfind('{', 0, m.start())
-        if start == -1:
-            continue
-        depth = 0
-        end = None
-        for i in range(start, min(len(raw), start + 40000)):
-            ch = raw[i]
-            if ch == '{':
-                depth += 1
-            elif ch == '}':
-                depth -= 1
-                if depth == 0:
-                    end = i + 1
-                    break
-        if end:
-            frag = raw[start:end]
-            try:
-                results.append(json.loads(frag))
-            except Exception:
-                continue
+    brace_depth = 0
+    start = None
+    for i, ch in enumerate(raw):
+        if ch == '{':
+            if brace_depth == 0:
+                start = i
+            brace_depth += 1
+        elif ch == '}':
+            brace_depth -= 1
+            if brace_depth == 0 and start is not None:
+                candidate = raw[start:i+1]
+                if key_regex.search(candidate):
+                    try:
+                        obj = json.loads(candidate)
+                        results.append(obj)
+                    except Exception:
+                        pass
+                start = None
     return results
+
 
 def extract_from_json(text: str):
     out = []
 
-    # raw JSON
-    try:
-        data = json.loads(text)
-        _walk_json(data, out)
-    except Exception:
-        pass
+    # Strategy 1: __NEXT_DATA__ script blocks
+    next_data_blobs = _extract_all_next_data(text)
+    for blob in next_data_blobs:
+        _walk_json(blob, out)
 
-    # ALL Next blocks (multi-page)
-    for nd in _extract_all_next_data(text):
-        _walk_json(nd, out)
+    # Strategy 2: Try parsing entire text as JSON
+    if not out:
+        try:
+            parsed = json.loads(text)
+            _walk_json(parsed, out)
+        except Exception:
+            pass
 
-    # heuristic scan
-    raw = htmllib.unescape(text)
-    for obj in _find_json_objects(raw):
-        _walk_json(obj, out)
+    # Strategy 3: Find embedded JSON objects
+    if not out:
+        found = _find_json_objects(text)
+        for obj in found:
+            _walk_json(obj, out)
 
-    # de-dupe
-    seen = set()
-    deduped = []
-    for r in out:
-        rt = (r.get('reviewText', '') or '').strip()
-        if not rt or _is_noise_reviewtext(rt):
-            continue
-        key = (rt[:220], r.get('reviewSubmissionTime', ''), str(r.get('rating', '')))
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(r)
+    return out
 
-    return deduped
 
 def extract_reviews(text: str):
     return extract_from_json(text or '')
+
 
 # --------------------- Sentiment & Keywords ---------------------
 
@@ -225,6 +236,7 @@ NEG_WORDS = set([
 ])
 
 # Shipping/service adjustment
+
 SHIPPING_TERMS = {
     'shipping','ship','delivery','delivered','arrived','arrival','carrier','fedex','ups','usps',
     'customer service','support','refund','return','replacement','damaged','broken','missing','late','delay','delays'
@@ -232,6 +244,7 @@ SHIPPING_TERMS = {
 SHIPPING_NEG_HINTS = {
     'terrible','awful','bad','late','delay','delays','damaged','broken','missing','no help','no support','customer service'
 }
+
 
 def normalize_text(s: str) -> str:
     if not isinstance(s, str):
@@ -243,8 +256,10 @@ def normalize_text(s: str) -> str:
     s = re.sub(r'\s+', ' ', s).strip()
     return s
 
+
 def token_filter(tokens):
     return [w for w in tokens if w and w not in STOPWORDS and len(w) > 2]
+
 
 def text_sentiment_score(text: str) -> float:
     t = normalize_text(text)
@@ -259,6 +274,7 @@ def text_sentiment_score(text: str) -> float:
         return 0.0
     return (pos - neg) / (pos + neg)
 
+
 def rating_score(val) -> float:
     try:
         r = float(val)
@@ -266,6 +282,7 @@ def rating_score(val) -> float:
         return (r - 3.0) / 2.0
     except Exception:
         return 0.0
+
 
 def _has_shipping_issue(title: str, text: str) -> bool:
     t = normalize_text((title or '') + ' ' + (text or ''))
@@ -277,6 +294,7 @@ def _has_shipping_issue(title: str, text: str) -> bool:
     has_neg = any(h in t for h in SHIPPING_NEG_HINTS) or 'shipping was' in t or 'delivery was' in t
     return has_neg
 
+
 def _has_product_praise(text: str) -> bool:
     t = normalize_text(text or '')
     if not t:
@@ -286,92 +304,72 @@ def _has_product_praise(text: str) -> bool:
     toks = token_filter(t.split())
     return sum(1 for w in toks if w in POS_WORDS) >= 2
 
+
 def compute_sentiment(rows):
     enriched = []
     for r in rows:
         txt = r.get('reviewText', '') or ''
         title = r.get('reviewTitle', '') or ''
+        rating_val = r.get('rating')
 
-        ts = float(text_sentiment_score(txt))
-        rating_val = r.get('rating', '')
-        rating_num = _to_float(rating_val)
-        rs = rating_score(rating_num if rating_num is not None else rating_val)
+        ts = text_sentiment_score(txt)
+        rs = rating_score(rating_val)
 
-        combined = 0.6 * rs + 0.4 * ts
+        # Force extremes
+        if rating_val is not None:
+            if float(rating_val) >= 5.0:
+                combined = 1.0
+            elif float(rating_val) <= 1.0:
+                combined = -1.0
+            else:
+                # Shipping vs product conflict -> neutral
+                if rating_val in (3, 4, 3.0, 4.0):
+                    if _has_shipping_issue(title, txt) and _has_product_praise(txt):
+                        combined = 0.15
+                    else:
+                        combined = 0.6 * rs + 0.4 * ts
+                else:
+                    combined = 0.6 * rs + 0.4 * ts
+        else:
+            combined = ts
 
-        # Force extremes per your rule
-        if rating_num == 5:
-            combined = 1.0
-        elif rating_num == 1:
-            combined = -1.0
-
-        # Shipping vs product conflict -> neutralize (3–4 stars)
-        shipping_conflict = (rating_num in (3, 4) and _has_shipping_issue(title, txt) and _has_product_praise(txt))
-        if shipping_conflict:
-            combined = 0.15  # neutral zone
-
-        # Keep your clamps for low/high ratings
-        if rating_num is not None and rating_num <= 2:
-            combined = min(combined, 0.0)
-        if rating_num is not None and rating_num >= 4:
-            combined = max(combined, 0.3)
-
-        # Label rules
-        if rating_num is not None and rating_num >= 4:
+        if combined > 0.2:
             label = 'positive'
-        elif rating_num is not None and rating_num <= 2:
+        elif combined < -0.2:
             label = 'negative'
         else:
-            if combined >= 0.3:
-                label = 'positive'
-            elif combined < 0.0:
-                label = 'negative'
-            else:
-                label = 'neutral'
-
-        if shipping_conflict:
             label = 'neutral'
 
-        enriched.append({
-            'rating': rating_val,
-            'reviewText': txt,
-            'reviewSubmissionTime': r.get('reviewSubmissionTime', ''),
-            'reviewTitle': title,
-            'text_score': round(ts, 3),
-            'rating_score': round(rs, 3),
-            'combined_score': round(combined, 3),
-            'sentiment': label,
-        })
+        enriched_row = dict(r)
+        enriched_row['text_sentiment'] = round(ts, 3)
+        enriched_row['rating_sentiment'] = round(rs, 3)
+        enriched_row['combined_sentiment'] = round(combined, 3)
+        enriched_row['sentiment_label'] = label
+        enriched_row['shipping_issue'] = _has_shipping_issue(title, txt)
+        enriched.append(enriched_row)
 
     return enriched
+
 
 # -------- Phrase extraction (replaces bigrams) --------
 
 def extract_top_phrases(texts, top_n=25, ngram_min=3, ngram_max=4):
     generic = {'love','product','products','able','get','got','find','found','use','using','work','works','working','would','recommend'}
     counts = Counter()
-
     for txt in texts:
         t = normalize_text(txt)
         if not t:
             continue
-        toks = [w for w in t.split() if w and w not in STOPWORDS]
-        if len(toks) < ngram_min:
-            continue
-
+        tokens = t.split()
+        filtered = [w for w in tokens if w not in STOPWORDS and len(w) > 2 and w not in generic]
         for n in range(ngram_min, ngram_max + 1):
-            for i in range(0, len(toks) - n + 1):
-                gram = toks[i:i+n]
-                if gram[0] in generic or gram[-1] in generic:
-                    continue
-                if all(w in generic for w in gram):
-                    continue
-                counts[' '.join(gram)] += 1
+            for i in range(len(filtered) - n + 1):
+                phrase = ' '.join(filtered[i:i+n])
+                counts[phrase] += 1
+    # Only keep phrases that appear at least 2 times
+    filtered_counts = {k: v for k, v in counts.items() if v >= 2}
+    return Counter(filtered_counts).most_common(top_n)
 
-    # Keep only phrases that repeat
-    filtered = [(p, c) for p, c in counts.items() if c >= 2]
-    filtered.sort(key=lambda x: (-x[1], x[0]))
-    return filtered[:top_n]
 
 def extract_keywords_and_bigrams(texts, top_n_words=25, top_n_bigrams=25):
     """
@@ -385,53 +383,45 @@ def extract_keywords_and_bigrams(texts, top_n_words=25, top_n_bigrams=25):
             continue
         all_tokens.extend(token_filter(t.split()))
 
-    top_words = Counter(all_tokens).most_common(top_n_words)
+    word_counts = Counter(all_tokens)
+    top_words = word_counts.most_common(top_n_words)
+
     top_phrases = extract_top_phrases(texts, top_n=top_n_bigrams)
+
     return top_words, top_phrases
 
+
 # -------- Word cloud --------
+
 from io import BytesIO
+
 
 def render_wordcloud_bytes(freq_items, fig_size=(4.6, 3.2)):
     if not MATPLOTLIB_OK:
         return b''
-
     if not freq_items:
-        fig, ax = plt.subplots(figsize=fig_size)
-        ax.text(0.5, 0.5, 'No terms', ha='center', va='center', fontsize=12)
-        ax.set_axis_off()
-        bio = BytesIO()
-        fig.savefig(bio, dpi=200, bbox_inches='tight', format='png')
-        plt.close(fig)
-        return bio.getvalue()
+        return b''
 
-    random.seed(42)
+    try:
+        from wordcloud import WordCloud
+    except ImportError:
+        return b''
+
+    freq_dict = dict(freq_items)
+    wc = WordCloud(
+        width=800,
+        height=500,
+        background_color='white',
+        colormap='viridis',
+        max_words=100,
+        prefer_horizontal=0.7,
+    ).generate_from_frequencies(freq_dict)
+
     fig, ax = plt.subplots(figsize=fig_size)
-    ax.set_axis_off(); ax.set_xlim(0, 1); ax.set_ylim(0, 1)
-
-    occupied = []
-
-    def place_word(text, font_size):
-        for _ in range(180):
-            x = random.uniform(0.10, 0.90)
-            y = random.uniform(0.15, 0.85)
-            t = ax.text(x, y, text, fontsize=font_size, ha='center', va='center', alpha=0.9)
-            fig.canvas.draw()
-            bbox = t.get_window_extent(renderer=fig.canvas.get_renderer()).transformed(ax.transData.inverted())
-            if not any(bbox.overlaps(ob) for ob in occupied):
-                occupied.append(bbox)
-                return True
-            t.remove()
-        return False
-
-    max_cnt = max(c for _, c in freq_items)
-    for token, cnt in freq_items:
-        size = 9 + int(18 * (cnt / max_cnt))
-        if not place_word(token, size):
-            ax.text(random.uniform(0.10, 0.90), random.uniform(0.15, 0.85), token,
-                    fontsize=8, ha='center', va='center', alpha=0.55)
-
-    bio = BytesIO()
-    fig.savefig(bio, dpi=220, bbox_inches='tight', format='png')
+    ax.imshow(wc, interpolation='bilinear')
+    ax.axis('off')
+    buf = BytesIO()
+    fig.savefig(buf, format='png', bbox_inches='tight', dpi=150)
     plt.close(fig)
-    return bio.getvalue()
+    buf.seek(0)
+    return buf.getvalue()
